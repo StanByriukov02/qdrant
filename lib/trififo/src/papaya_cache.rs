@@ -1,8 +1,8 @@
-//! A concurrent S3-FIFO cache with lock-free reads and low-latency inserts.
+//! A concurrent S3-FIFO cache with lock-free reads and mutex-protected inserts.
 //!
 //! This module provides a thread-safe cache implementation where:
 //! - Reads are lock-free and can happen concurrently
-//! - Writes use the LMAX Disruptor pattern for minimal latency
+//! - Writes use a mutex-protected SeqLockWriter for consistency
 //!
 //! The key insight enabling this design is that reads only:
 //! 1. Look up an offset in a lock-free concurrent hashtable (papaya)
@@ -13,28 +13,26 @@
 
 use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use disruptor::{BusySpin, Producer, build_multi_producer};
 use parking_lot::Mutex;
 
 use crate::s3fifo::{Entry, GlobalOffset, LocalOffset, S3Fifo};
-use crate::seqlock::{SeqLock, SeqLockReader};
+use crate::seqlock::{SeqLock, SeqLockReader, SeqLockWriter};
 
-/// A concurrent S3-FIFO cache using the Disruptor pattern.
+/// A concurrent S3-FIFO cache using papaya for the hashtable.
 ///
 /// This cache supports lock-free reads via `get()` which takes `&self`.
-/// Inserts are performed via `insert()` which also takes `&self` and publishes
-/// to a high-performance Disruptor ring buffer for processing by a dedicated thread.
+/// Inserts are performed via `insert()` which also takes `&self` and uses
+/// a mutex-protected writer for consistency.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use trififo::ConcurrentCache;
+/// use trififo::PapayaCache;
 ///
-/// let cache = ConcurrentCache::<u64, String>::new(1000, 0.1, 0.9, Default::default());
+/// let cache = PapayaCache::<u64, String>::new(1000, 0.1, 0.9, Default::default());
 ///
-/// // Insert (low-latency, publishes to disruptor)
+/// // Insert
 /// cache.insert(1, "hello".to_string());
 ///
 /// // Get (lock-free read)
@@ -45,65 +43,10 @@ use crate::seqlock::{SeqLock, SeqLockReader};
 pub struct PapayaCache<K, V, S = ahash::RandomState> {
     /// Shared state for lock-free reads
     reader: SeqLockReader<CacheInner<K, V, S>>,
-    /// Pool of producers for receiving inserts from multiple threads, but applying
-    /// them on a single one.
-    /// Each producer is protected by its own mutex, and threads round-robin
-    /// across the pool to minimize contention.
-    producer_pool: Arc<ProducerPool<K, V>>,
+
+    /// Mutex-protected writer for inserts
+    writer: Mutex<SeqLockWriter<CacheInner<K, V, S>>>,
 }
-
-type DynProducer<K, V> = Box<dyn FnMut(K, V) + Send>;
-
-/// Pool of producers to reduce contention on multi-threaded inserts.
-struct ProducerPool<K, V> {
-    producers: Box<[Mutex<DynProducer<K, V>>]>,
-    /// Counter for round-robin selection of producers
-    next_producer: AtomicUsize,
-}
-
-impl<K, V> ProducerPool<K, V> {
-    fn new(producers: Vec<Box<dyn FnMut(K, V) + Send>>) -> Self {
-        Self {
-            producers: producers.into_iter().map(Mutex::new).collect(),
-            next_producer: AtomicUsize::new(0),
-        }
-    }
-
-    /// Publish using round-robin producer selection.
-    /// This distributes load across producers to reduce contention.
-    #[inline]
-    fn publish(&self, key: K, value: V) {
-        let pool_size = self.producers.len();
-        // Use relaxed ordering - we don't need strict round-robin, just distribution
-        let index = self.next_producer.fetch_add(1, Ordering::Relaxed) % pool_size;
-        let mut producer = self.producers[index].lock();
-        (producer)(key, value);
-    }
-}
-
-/// Event published to the disruptor ring buffer.
-/// Uses UnsafeCell to allow taking values out in the processor.
-#[derive(Default)]
-struct InsertEvent<K, V> {
-    key: K,
-    value: V,
-}
-
-// Safety: InsertEvent is only accessed by one thread at a time:
-// - The producer thread writes to it
-// - The consumer thread reads from it
-// The disruptor guarantees these accesses don't overlap.
-// unsafe impl<K: Send, V: Send> Send for InsertEvent<K, V> {}
-// unsafe impl<K: Send, V: Send> Sync for InsertEvent<K, V> {}
-
-// impl<K, V> Default for InsertEvent<K, V> {
-//     fn default() -> Self {
-//         Self {
-//             key: None,
-//             value: None,
-//         }
-//     }
-// }
 
 /// Shared reader state - contains only read-side handles.
 /// This is `Send + Sync` and can be shared via `Arc`.
@@ -115,7 +58,7 @@ struct CacheInner<K, V, S> {
 }
 
 // ============================================================================
-// ConcurrentCache implementation
+// PapayaCache implementation
 // ============================================================================
 
 impl<K, V, S> PapayaCache<K, V, S>
@@ -124,10 +67,6 @@ where
     V: Default + Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Default + Send + Sync + 'static,
 {
-    /// Default number of producers in the pool.
-    /// This provides a good balance between reduced contention and resource usage.
-    const DEFAULT_PRODUCER_POOL_SIZE: usize = 4;
-
     /// Creates a new concurrent cache.
     ///
     /// # Arguments
@@ -139,70 +78,7 @@ where
     /// # Panics
     /// Panics if capacity is 0.
     pub fn new(capacity: usize, small_ratio: f32, ghost_ratio: f32, hasher: S) -> Self {
-        Self::with_disruptor_config(
-            capacity,
-            small_ratio,
-            ghost_ratio,
-            hasher,
-            1024,
-            Self::DEFAULT_PRODUCER_POOL_SIZE,
-        )
-    }
-
-    /// Creates a new concurrent cache with a custom disruptor ring buffer size.
-    ///
-    /// # Arguments
-    /// * `capacity` - Maximum number of entries (small + main queues)
-    /// * `small_ratio` - Fraction of capacity for small queue (typically 0.1)
-    /// * `ghost_ratio` - Fraction of capacity for ghost queue (typically 0.9)
-    /// * `hasher` - Hash builder for key hashing
-    /// * `disruptor_size` - Size of the disruptor ring buffer (must be power of 2)
-    ///
-    /// # Panics
-    /// Panics if capacity is 0 or disruptor_size is not a power of 2.
-    pub fn with_disruptor_size(
-        capacity: usize,
-        small_ratio: f32,
-        ghost_ratio: f32,
-        hasher: S,
-        disruptor_size: usize,
-    ) -> Self {
-        Self::with_disruptor_config(
-            capacity,
-            small_ratio,
-            ghost_ratio,
-            hasher,
-            disruptor_size,
-            Self::DEFAULT_PRODUCER_POOL_SIZE,
-        )
-    }
-
-    /// Creates a new concurrent cache with full configuration options.
-    ///
-    /// # Arguments
-    /// * `capacity` - Maximum number of entries (small + main queues)
-    /// * `small_ratio` - Fraction of capacity for small queue (typically 0.1)
-    /// * `ghost_ratio` - Fraction of capacity for ghost queue (typically 0.9)
-    /// * `hasher` - Hash builder for key hashing
-    /// * `disruptor_size` - Size of the disruptor ring buffer (must be power of 2)
-    /// * `producer_pool_size` - Number of producers in the pool (reduces contention)
-    ///
-    /// # Panics
-    /// Panics if capacity is 0, disruptor_size is not a power of 2, or producer_pool_size is 0.
-    pub fn with_disruptor_config(
-        capacity: usize,
-        small_ratio: f32,
-        ghost_ratio: f32,
-        hasher: S,
-        disruptor_size: usize,
-        producer_pool_size: usize,
-    ) -> Self {
         assert!(capacity > 0);
-        assert!(
-            disruptor_size.is_power_of_two(),
-            "disruptor_size must be a power of 2"
-        );
-        assert!(producer_pool_size > 0, "producer_pool_size must be > 0");
 
         // Create the FIFO queues with separate reader/writer handles
         let fifos = S3Fifo::new(capacity, small_ratio, ghost_ratio);
@@ -227,34 +103,9 @@ where
 
         let (reader, cache_writer) = SeqLock::new_reader_writer(cache_inner);
 
-        // Create the disruptor with a processor that handles inserts
-        let factory = InsertEvent::default;
-        let processor = move |event: &InsertEvent<K, V>, _sequence: i64, _end_of_batch: bool| {
-            unsafe { cache_writer.write(|cache| cache.do_insert(event.key, event.value.clone())) };
-        };
-
-        let producer = build_multi_producer(disruptor_size, factory, BusySpin)
-            .handle_events_with(processor)
-            .build();
-
-        // Create a pool of producers by cloning the MultiProducer
-        // Each clone can publish independently, reducing contention
-        let producers: Vec<Box<dyn FnMut(K, V) + Send>> = (0..producer_pool_size)
-            .map(|_| {
-                let mut producer_clone = producer.clone();
-                let publish_fn: Box<dyn FnMut(K, V) + Send> = Box::new(move |key: K, value: V| {
-                    producer_clone.publish(|event| {
-                        event.key = key;
-                        event.value = value;
-                    });
-                });
-                publish_fn
-            })
-            .collect();
-
         Self {
             reader,
-            producer_pool: Arc::new(ProducerPool::new(producers)),
+            writer: Mutex::new(cache_writer),
         }
     }
 
@@ -282,18 +133,15 @@ where
 
     /// Inserts a key-value pair into the cache.
     ///
-    /// This operation publishes to the Disruptor ring buffer for low-latency
-    /// processing by the dedicated writer thread.
-    ///
     /// If the key already exists:
     /// - In ghost queue: promotes to main queue with the new value
     /// - In small/main queue: increments recency (value is NOT updated)
     ///
     /// This method is thread-safe and can be called concurrently from multiple threads.
-    /// Uses a pool of producers with round-robin selection to minimize contention.
     #[inline]
     pub fn insert(&self, key: K, value: V) {
-        self.producer_pool.publish(key, value);
+        let writer_guard = self.writer.lock();
+        unsafe { writer_guard.write(|cache| cache.do_insert(key, value)) };
     }
 
     /// Returns the number of entries in the cache.
@@ -402,7 +250,7 @@ where
     fn push_to_small_queue(&mut self, entry: Entry<K, V>) -> LocalOffset {
         // Try to push if not full
         let entry = match self.fifos.small.try_push(entry) {
-            Ok(offset) => return LocalOffset::Main(offset as u32),
+            Ok(offset) => return LocalOffset::Small(offset as u32),
             Err(entry) => entry,
         };
 
@@ -442,9 +290,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
-    use std::time::Duration;
 
     use super::*;
 
@@ -453,9 +300,6 @@ mod tests {
         let cache = PapayaCache::<u64, String>::new(100, 0.1, 0.9, Default::default());
 
         cache.insert(1, "hello".to_string());
-
-        // Give the disruptor time to process
-        thread::sleep(Duration::from_millis(10));
 
         let value = cache.get(&1);
         assert_eq!(value, Some("hello".to_string()));
@@ -469,9 +313,6 @@ mod tests {
         for i in 0..10 {
             cache.insert(i, format!("value_{i}"));
         }
-
-        // Give time for inserts to process
-        thread::sleep(Duration::from_millis(50));
 
         // Spawn multiple reader threads
         let cache = Arc::new(cache);
@@ -512,7 +353,6 @@ mod tests {
         });
 
         let reader = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
             for _ in 0..100 {
                 for i in 0..100 {
                     let _ = cache_reader.get(&i);
@@ -531,38 +371,9 @@ mod tests {
         assert!(cache.is_empty());
 
         cache.insert(1, "hello".to_string());
-        thread::sleep(Duration::from_millis(10));
 
         assert!(!cache.is_empty());
         assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn test_custom_disruptor_size() {
-        // Use larger capacity to ensure all entries fit
-        let cache = PapayaCache::<u64, String>::with_disruptor_size(
-            1000,
-            0.1,
-            0.9,
-            Default::default(),
-            256,
-        );
-
-        for i in 0..50 {
-            cache.insert(i, format!("value_{i}"));
-        }
-
-        thread::sleep(Duration::from_millis(100));
-
-        // Verify entries are found (some may be in ghost queue and return None,
-        // but most should be accessible)
-        let mut found = 0;
-        for i in 0..50 {
-            if cache.get(&i).is_some() {
-                found += 1;
-            }
-        }
-        assert!(found > 0, "Should have found at least some entries");
     }
 
     #[test]
@@ -592,9 +403,6 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-
-        // Give time for all inserts to process
-        thread::sleep(Duration::from_millis(100));
 
         // Verify some entries (not all may be present due to cache size)
         let mut found = 0;
@@ -637,9 +445,6 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-
-        // Give time for processing
-        thread::sleep(Duration::from_millis(100));
 
         assert!(!cache.is_empty());
     }

@@ -1918,17 +1918,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "disruptor"
-version = "3.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c19b278be1f736d7cd35ca8581754af80bb289a81dc2074175a6f08935a780a"
-dependencies = [
- "core_affinity",
- "crossbeam-utils",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "docopt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7999,7 +7988,6 @@ dependencies = [
  "ahash",
  "cap",
  "criterion",
- "disruptor",
  "foyer",
  "hashbrown 0.16.1",
  "itertools 0.14.0",

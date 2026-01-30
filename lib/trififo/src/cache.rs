@@ -1,73 +1,24 @@
-/*
-qdrant/lib/trififo/src/concurrent_cache_hashbrown.rs
-
-A concurrent S3-FIFO cache implementation that keeps the single-writer
-(disruptor) + concurrent-read (seqlock) architecture from
-`concurrent_cache.rs` but uses `hashbrown::HashTable` instead of `papaya`.
-*/
-
 use std::hash::{BuildHasher, Hash};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use disruptor::{BusySpin, Producer, build_multi_producer};
 use hashbrown::HashTable;
 use parking_lot::Mutex;
 
 use crate::s3fifo::{Entry, LocalOffset, S3Fifo};
-use crate::seqlock::{SeqLock, SeqLockReader};
+use crate::seqlock::{SeqLock, SeqLockReader, SeqLockWriter};
 
-/// A concurrent S3-FIFO cache using the Disruptor pattern and `hashbrown` for
-/// the hashtable.
+/// A concurrent S3-FIFO cache with a `hashbrown::HashTable` which stores the
+/// keys in the FIFO queues for lower memory overhead.
 ///
 /// Design:
-/// - Readers call `get(&self, key)` and obtain a read-side snapshot via a
-///   `SeqLockReader`. Reads are lock-free (only atomic seqlock checks) and can
-///   happen concurrently.
-/// - Writers publish insert events to a disruptor ring buffer. A single
-///   dedicated writer thread processes events and mutates the `CacheInner`.
+/// - Reads are lock-free (only atomic seqlock checks) and can happen concurrently.
+/// - Writers share the same writer behind a mutex, so they will contend if another
+///   write is taking place.
 pub struct Cache<K, V, S = ahash::RandomState> {
     /// Shared state for lock-free readers.
     reader: SeqLockReader<CacheInner<K, V, S>>,
-    /// Pool of producers for publishing insert events from multiple threads.
-    producer_pool: Arc<ProducerPool<K, V>>,
-}
 
-type DynProducer<K, V> = Box<dyn FnMut(K, V) + Send>;
-
-/// Pool of mutex-protected publish closures to reduce publish contention.
-struct ProducerPool<K, V> {
-    producers: Box<[Mutex<DynProducer<K, V>>]>,
-    next_producer: AtomicUsize,
-}
-
-impl<K, V> ProducerPool<K, V> {
-    fn new(producers: Vec<Box<dyn FnMut(K, V) + Send>>) -> Self {
-        Self {
-            producers: producers.into_iter().map(Mutex::new).collect(),
-            next_producer: AtomicUsize::new(0),
-        }
-    }
-
-    #[inline]
-    fn publish(&self, key: K, value: V) {
-        let pool_size = self.producers.len();
-        let index = self.next_producer.fetch_add(1, Ordering::Relaxed) % pool_size;
-        let mut producer = self.producers[index].lock();
-        (producer)(key, value);
-    }
-}
-
-/// Event published into the disruptor ring buffer.
-///
-/// The event is simple: stores a key and a value. The processor will take a
-/// clone of the value when needed. UnsafeCell isn't necessary here because the
-/// disruptor factory provides fresh events; keep this simple and derive
-/// Default.
-#[derive(Default)]
-struct InsertEvent<K, V> {
-    key: K,
-    value: V,
+    writer: Mutex<SeqLockWriter<CacheInner<K, V, S>>>,
 }
 
 /// Inner cache state. This is the state the seqlock protects.
@@ -81,9 +32,16 @@ struct CacheInner<K, V, S> {
     hasher: S,
 }
 
-// ============================================================================
-// Public API
-// ============================================================================
+impl<K, V> Cache<K, V, ahash::RandomState>
+where
+    K: Default + Copy + Hash + Eq + Send + Sync + 'static,
+    V: Default + Clone + Send + Sync + 'static,
+{
+    /// Create a new concurrent cache with default disruptor size and producer pool.
+    pub fn new(capacity: usize) -> Self {
+        Self::with_config(capacity, 0.1, 0.9, ahash::RandomState::new())
+    }
+}
 
 impl<K, V, S> Cache<K, V, S>
 where
@@ -91,54 +49,9 @@ where
     V: Default + Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Default + Send + Sync + 'static,
 {
-    /// Default number of producers in the pool.
-    const DEFAULT_PRODUCER_POOL_SIZE: usize = 4;
-
-    /// Create a new concurrent cache with default disruptor size and producer pool.
-    pub fn new(capacity: usize, small_ratio: f32, ghost_ratio: f32, hasher: S) -> Self {
-        Self::with_disruptor_config(
-            capacity,
-            small_ratio,
-            ghost_ratio,
-            hasher,
-            1024,
-            Self::DEFAULT_PRODUCER_POOL_SIZE,
-        )
-    }
-
     /// Create with custom disruptor ring size.
-    pub fn with_disruptor_size(
-        capacity: usize,
-        small_ratio: f32,
-        ghost_ratio: f32,
-        hasher: S,
-        disruptor_size: usize,
-    ) -> Self {
-        Self::with_disruptor_config(
-            capacity,
-            small_ratio,
-            ghost_ratio,
-            hasher,
-            disruptor_size,
-            Self::DEFAULT_PRODUCER_POOL_SIZE,
-        )
-    }
-
-    /// Full configuration entrypoint.
-    pub fn with_disruptor_config(
-        capacity: usize,
-        small_ratio: f32,
-        ghost_ratio: f32,
-        hasher: S,
-        disruptor_size: usize,
-        producer_pool_size: usize,
-    ) -> Self {
+    pub fn with_config(capacity: usize, small_ratio: f32, ghost_ratio: f32, hasher: S) -> Self {
         assert!(capacity > 0);
-        assert!(
-            disruptor_size.is_power_of_two(),
-            "disruptor_size must be power of two"
-        );
-        assert!(producer_pool_size > 0, "producer_pool_size must be > 0");
 
         // Create FIFOs (reader + writer halves are managed by S3Fifo)
         let fifos = S3Fifo::new(capacity, small_ratio, ghost_ratio);
@@ -147,6 +60,7 @@ where
         //
         // Maximum entries = small + main + ghost = capacity + ghost_size
         let max_entries = capacity + (capacity as f32 * ghost_ratio) as usize;
+
         // IMPORTANT: Allocate for 2x as much entries so that hashtable can be rehashed in-place if needed,
         // but never resized and reallocate.
         // See: https://github.com/rust-lang/hashbrown/blob/9641fb3eea9a07933fb631da6e4f5070d2f7e1da/src/raw.rs#L2775
@@ -165,32 +79,9 @@ where
         // Create seqlock reader/writer pair
         let (reader, cache_writer) = SeqLock::new_reader_writer(cache_inner);
 
-        // Build disruptor with a processor that applies inserts on the writer thread.
-        let factory = InsertEvent::default;
-        let processor = move |event: &InsertEvent<K, V>, _sequence: i64, _end_of_batch: bool| {
-            unsafe { cache_writer.write(|cache| cache.do_insert(event.key, event.value.clone())) };
-        };
-
-        let producer = build_multi_producer(disruptor_size, factory, BusySpin)
-            .handle_events_with(processor)
-            .build();
-
-        // Create a small pool of producers to reduce publish contention
-        let producers: Vec<Box<dyn FnMut(K, V) + Send>> = (0..producer_pool_size)
-            .map(|_| {
-                let mut producer_clone = producer.clone();
-                Box::new(move |key: K, value: V| {
-                    producer_clone.publish(|event| {
-                        event.key = key;
-                        event.value = value;
-                    });
-                }) as Box<dyn FnMut(K, V) + Send>
-            })
-            .collect();
-
         Self {
             reader,
-            producer_pool: Arc::new(ProducerPool::new(producers)),
+            writer: Mutex::new(cache_writer),
         }
     }
 
@@ -221,7 +112,8 @@ where
     /// Publish an insert for processing by the writer thread.
     #[inline]
     pub fn insert(&self, key: K, value: V) {
-        self.producer_pool.publish(key, value);
+        let writer_guard = self.writer.lock();
+        unsafe { writer_guard.write(|cache| cache.do_insert(key, value)) };
     }
 
     /// Number of entries tracked by the hashtable (reads via seqlock).
@@ -451,7 +343,7 @@ mod tests {
 
     #[test]
     fn basic_insert_get() {
-        let cache = Cache::<u64, String>::new(100, 0.1, 0.9, Default::default());
+        let cache = Cache::<u64, String>::new(100);
 
         cache.insert(1, "hello".to_string());
         thread::sleep(Duration::from_millis(10));
@@ -462,7 +354,7 @@ mod tests {
 
     #[test]
     fn concurrent_reads() {
-        let cache = Cache::<u64, String>::new(200, 0.1, 0.9, Default::default());
+        let cache = Cache::<u64, String>::new(200);
 
         for i in 0..20u64 {
             cache.insert(i, format!("val_{i}"));
@@ -491,7 +383,7 @@ mod tests {
 
     #[test]
     fn multi_threaded_inserts() {
-        let cache = Arc::new(Cache::<u64, u64>::new(5000, 0.1, 0.9, Default::default()));
+        let cache = Arc::new(Cache::<u64, u64>::new(5000));
 
         const THREADS: usize = 4;
         const PER: u64 = 1000;
@@ -526,7 +418,7 @@ mod tests {
 
     #[test]
     fn len_is_empty() {
-        let cache = Cache::<u64, String>::new(100, 0.1, 0.9, Default::default());
+        let cache = Cache::<u64, String>::new(100);
         assert!(cache.is_empty());
         cache.insert(42, "v".to_string());
         thread::sleep(Duration::from_millis(10));
@@ -535,7 +427,7 @@ mod tests {
 
     #[test]
     fn high_contention_inserts() {
-        let cache = Arc::new(Cache::<u64, u64>::new(2000, 0.1, 0.9, Default::default()));
+        let cache = Arc::new(Cache::<u64, u64>::new(2000));
         let counter = Arc::new(AtomicUsize::new(0));
 
         const THREADS: usize = 8;
@@ -570,12 +462,7 @@ mod tests {
     #[test]
     fn fuzz_never_returns_unseen_value() {
         const CAPACITY: usize = 1024;
-        let cache = Arc::new(Cache::<u64, u64>::new(
-            CAPACITY,
-            0.1,
-            0.9,
-            Default::default(),
-        ));
+        let cache = Arc::new(Cache::<u64, u64>::new(CAPACITY));
 
         const KEY_SPACE: u64 = 10240;
         const WRITERS: usize = 6;
