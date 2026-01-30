@@ -31,6 +31,8 @@ unsafe impl<T: Send + Sync> Sync for RingBuffer<T> {}
 
 impl<T> RingBuffer<T> {
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "Ring buffer capacity must be greater than 0");
+
         let buffer: Box<[UnsafeCell<MaybeUninit<T>>]> = (0..capacity)
             .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
             .collect();
