@@ -230,7 +230,7 @@ where
         // Create the disruptor with a processor that handles inserts
         let factory = InsertEvent::default;
         let processor = move |event: &InsertEvent<K, V>, _sequence: i64, _end_of_batch: bool| {
-            cache_writer.write(|cache| cache.do_insert(event.key, event.value.clone()));
+            unsafe { cache_writer.write(|cache| cache.do_insert(event.key, event.value.clone())) };
         };
 
         let producer = build_multi_producer(disruptor_size, factory, BusySpin)

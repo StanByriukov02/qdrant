@@ -8011,6 +8011,7 @@ dependencies = [
  "rayon",
  "ringbuf",
  "schnellru",
+ "static_assertions",
  "strum",
  "tokio",
 ]
