@@ -294,7 +294,7 @@ async fn test_wal_replay_loads_pending_to_queue() {
     // Insert all operations
     for i in 0..total_ops {
         let point = PointStructPersisted {
-            id: (i as u64).into(),
+            id: i.into(),
             vector: VectorStructInternal::from(vec![1.0, 2.0, 3.0, 4.0]).into(),
             payload: None,
         };
@@ -319,7 +319,7 @@ async fn test_wal_replay_loads_pending_to_queue() {
 
     // Read the current applied_seq value
     let current_applied_seq = applied_seq_handler.op_num().unwrap_or(0);
-    eprintln!("Current applied_seq: {}", current_applied_seq);
+    eprintln!("Current applied_seq: {current_applied_seq}");
 
     // Calculate the target low value:
     // - upper_bound = (total_ops - 100) + 64 = total_ops - 36
@@ -334,13 +334,11 @@ async fn test_wal_replay_loads_pending_to_queue() {
             .force_set_and_persist(low_applied_seq)
             .unwrap();
         eprintln!(
-            "Reduced applied_seq from {} to {}, total_ops: {}",
-            current_applied_seq, low_applied_seq, total_ops
+            "Reduced applied_seq from {current_applied_seq} to {low_applied_seq}, total_ops: {total_ops}"
         );
     } else {
         eprintln!(
-            "Applied_seq {} is already <= target {}, total_ops: {}",
-            current_applied_seq, low_applied_seq, total_ops
+            "Applied_seq {current_applied_seq} is already <= target {low_applied_seq}, total_ops: {total_ops}"
         );
     }
 
@@ -363,12 +361,18 @@ async fn test_wal_replay_loads_pending_to_queue() {
 
     // Check update queue info immediately after load.
     let post_load_info = shard.local_update_queue_info();
-    eprintln!("Post-load update queue info: {:?}", post_load_info);
+    eprintln!("Post-load update queue info: {post_load_info:?}");
 
     // The applied_seq should be the value we set
     assert!(
         post_load_info.op_num.is_some(),
         "applied_seq should be tracked"
+    );
+
+    // Length should be not zero, as there should be pending ops loaded into the queue.
+    assert!(
+        post_load_info.length > 0,
+        "update queue should have pending operations after WAL replay"
     );
 
     let loaded_applied_seq = post_load_info.op_num.unwrap();
@@ -395,8 +399,7 @@ async fn test_wal_replay_loads_pending_to_queue() {
     let points_count = info.points_count.unwrap_or(0);
     assert_eq!(
         points_count, total_ops as usize,
-        "All {} points should be present after WAL replay and update queue processing",
-        total_ops
+        "All {total_ops} points should be present after WAL replay and update queue processing",
     );
 
     shard.stop_gracefully().await;
